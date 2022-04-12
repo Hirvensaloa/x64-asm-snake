@@ -1,4 +1,4 @@
-; file for testing Xlib api
+; Snake game in x64 assembly. Works on 64-bit Linux. 
 
 global main
 
@@ -21,49 +21,41 @@ extern XkbKeycodeToKeysym
 
 ; libc functions
 extern clock
-; libc helpers, TODO: replace these in production code
+extern getrandom
+extern malloc
+extern realloc
+extern free
 extern printf
 extern exit
 
 section .data
 
-; Logs
-dev_log: 
-    .expose db "Exposure", 10, 0
-    .keypress db "Keypress", 10, 0
-    .event_not_recognized db "Event not recognized", 10, 0
-    .key_press_not_recognized db "Key press not recognized", 10, 0
-    .left db "Left", 10, 0
-    .right db "Right", 10, 0
-    .up db "Up", 10, 0
-    .down db "Down", 10, 0
-    .number_str db "Number: %d", 10, 0
-    .x_str db "X: %d", 10, 0
-    .y_str db "Y: %d", 10, 0
-    .number db " %d", 0
-    .result db "Result: %d", 10, 0
-    .correct_overflow db "Correct overflow %c", 10, 0
-game_log:
-    .start db "Game started", 10, 0
-    .end db "Game ended", 10, 0
-error: db "Error", 0
+; ----------- Configs -----------
 
-; Game values   
-tick_interval: dq 250 * 1000 ; milliseconds * CLOCKS_PER_MS
-
+; Snake starting coordinates
 start_x db 1
 start_y db 1
+
+; Gamemap values
+tile_size db 10
+map_width dd 64
+map_height dd 64
+
+; ------------ ----------- ------------
+
+; Logs
+game_log:
+    .start db "Game started", 10, 0
+    .end db "Game ended! Total score: %d", 10, 0
+
+; Game values   
+tick_interval: dq 100 * 1000 ; milliseconds * CLOCKS_PER_MS
 
 ; Indicates which way the snake is moving
 going_up db 0
 going_down db 1
 going_left db 2
 going_right db 3
-
-; Gamemap values
-tile_size db 10
-map_width dd 64 
-map_height dd 64
 
 ; Xlib values
 exposureMask dq 32768
@@ -86,9 +78,18 @@ last_tick_count resq 1
 ; Game state variables
 snake_head_x resb 1
 snake_head_y resb 1
-snake_tail_x resb 1
-snake_tail_y resb 1
+snake_head_old_x resb 1
+snake_head_old_y resb 1
+snake_end_x resb 1
+snake_end_y resb 1
+snake_tail_x resq 1
+snake_tail_y resq 1
 snake_dir resb 1
+snake_length resw 1
+food_x resb 1
+food_y resb 1
+advance_game resb 1
+
 
 ; Pixel values
 pixels:
@@ -113,17 +114,17 @@ xevent resb 192
 section .text
 
 advance_game:
-    ; Print x and y
-    mov rdi, dev_log.x_str
-    movzx rsi, byte [snake_head_x]
-    sub rsp, 8
-    call printf
-    add rsp, 8
-    mov rdi, dev_log.y_str
-    movzx rsi, byte [snake_head_y]
-    sub rsp, 8
-    call printf
-    add rsp, 8
+    ; Set the old head to the tail. r8b & r9b stores the old tail index 0. 
+    mov r14, [snake_tail_x]
+    mov r15, [snake_tail_y]
+    mov r8b, [r14]
+    mov r9b, [r15]
+    mov [snake_head_old_x], r8b
+    mov [snake_head_old_y], r9b
+    mov al, [snake_head_x]
+    mov bl, [snake_head_y]
+    mov [r14], al
+    mov [r15], bl
 
     ; Move snake to the next position
 
@@ -133,22 +134,12 @@ check_up:
     cmp al, [going_up]
     jne check_right
 
-    mov rdi, dev_log.up
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     dec byte [snake_head_y]
     jmp correct_underflow_x
 
 check_right: 
     cmp al, [going_right]
     jne check_down
-
-    mov rdi, dev_log.right
-    sub rsp, 8
-    call printf
-    add rsp, 8
 
     inc byte [snake_head_x]
     jmp correct_underflow_x
@@ -157,22 +148,12 @@ check_down:
     cmp al, [going_down]
     jne go_left
 
-    mov rdi, dev_log.down
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     inc byte [snake_head_y]
     jmp correct_underflow_x
 
     ; Left is the only option left so no checks needed
 go_left:
     dec byte [snake_head_x]
-
-    mov rdi, dev_log.left
-    sub rsp, 8
-    call printf
-    add rsp, 8
 
 correct_underflow_x:
     ; Check if snake is out of bounds
@@ -182,7 +163,7 @@ correct_underflow_x:
 
     mov al, byte [map_width]
     mov [snake_head_x], al
-    jmp game_state_updated
+    jmp snake_coords_updated
 
 correct_underflow_y:
     ; Check if snake is out of bounds
@@ -192,7 +173,7 @@ correct_underflow_y:
 
     mov al, byte [map_height]
     mov [snake_head_y], al
-    jmp game_state_updated
+    jmp snake_coords_updated
 
 correct_overflow_x:
     ; Check if snake is out of bounds
@@ -200,31 +181,91 @@ correct_overflow_x:
     cmp eax, [map_width]
     js correct_overflow_y
 
-    mov rdi, dev_log.correct_overflow
-    mov rsi, 'x'
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     mov byte [snake_head_x], 0
-    jmp game_state_updated
+    jmp snake_coords_updated
 
 correct_overflow_y:
     ; Check if snake is out of bounds
     movzx eax, byte [snake_head_y]
     cmp eax, [map_height]
-    js game_state_updated
-
-    mov rdi, dev_log.correct_overflow
-    mov rsi, 'y'
-    sub rsp, 8
-    call printf
-    add rsp, 8
+    js snake_coords_updated
 
     mov byte [snake_head_y], 0
     
     ; Game state updated, return
+snake_coords_updated:
+
+    ; Check if snake has eaten food
+    mov al, [snake_head_x]
+    cmp al, [food_x]
+    jne move_tail
+    mov bl, [snake_head_y]
+    cmp bl, [food_y]
+    jne move_tail
+
+    inc word [snake_length]
+
+    ; Snake ate food, get new food position
+    sub rsp, 8
+    call randomize_food_xy
+    add rsp, 8
+
+    ; Allocate memory for the new snake tail (length has increased by one). 
+    mov rdi, [snake_tail_x]
+    movzx rsi, word [snake_length]
+    sub rsp, 8
+    call realloc
+    add rsp, 8
+    mov [snake_tail_x], rax
+
+    mov rdi, [snake_tail_y]
+    movzx rsi, word [snake_length]
+    sub rsp, 8
+    call realloc
+    add rsp, 8
+    mov [snake_tail_y], rax
+
+move_tail:
+    ; loop through the snake tail. Move [i] -> [i + 1], [i + 1] -> [i + 2], etc.
+    mov r14, [snake_tail_x]
+    mov r15, [snake_tail_y]
+    mov r8b, [snake_head_old_x]
+    mov r9b, [snake_head_old_y]
+
+    xor ch, ch ; index
+tail_loop:
+    inc ch
+    cmp ch, [snake_length]
+    jge update_end
+
+    inc r14
+    inc r15
+    mov al, [r14]
+    mov bl, [r15]
+    mov [r14], r8b
+    mov [r15], r9b
+    mov r8b, al
+    mov r9b, bl
+    jmp tail_loop
+
+update_end:
+    ; Update the new snake end
+    mov r8b, byte [r14]
+    mov r9b, byte [r15]
+    mov [snake_end_x], r8b
+    mov [snake_end_y], r9b
+
 game_state_updated:
+
+    ; Check if snake has hit itself
+    mov bl, [snake_head_x]
+    mov cl, [snake_head_y]
+    sub rsp, 8
+    call collides_with_snake_tail
+    add rsp, 8
+    test al, al
+    jnz exit_program
+
     ret 
 
 main: 
@@ -343,12 +384,33 @@ main:
     add rsp, 8
 
     ; Initialize snake
-    mov al, [start_x]
-    mov bl, [start_y]
-    mov cl, [going_right]
-    mov [snake_head_x], al
-    mov [snake_head_y], bl
-    mov [snake_dir], cl
+    mov bl, [start_x]
+    mov cl, [start_y]
+    mov dl, [going_right]
+    mov [snake_head_x], bl
+    mov [snake_head_y], cl
+    mov [snake_end_x], bl
+    mov [snake_end_y], cl
+    mov [snake_dir], dl
+    mov word [snake_length], 1
+    ; Allocate memory for snake tail
+    movzx rdi, word [snake_length]
+    sub rsp, 8
+    call malloc
+    add rsp, 8
+    mov r14, rax
+    sub rsp, 8
+    call malloc
+    add rsp, 8
+    mov r15, rax
+    ; Initialize snake tail
+    mov [r14], bl
+    mov [r15], cl
+    mov [snake_tail_x], r14
+    mov [snake_tail_y], r15
+
+    ; Initialize food position
+    call randomize_food_xy
 
     ; Main loop, listens for events
 main_loop:
@@ -371,10 +433,16 @@ main_loop:
     ; Update last tick count
     mov [last_tick_count], rax
 
+    cmp [advance_game], 0
+    jne draw_new
+
     ; Update game state
     sub rsp, 8
     call advance_game
     add rsp, 8
+
+draw_new:
+    mov [advance_game], 0
 
     ; draw new state
     sub rsp, 8
@@ -414,21 +482,11 @@ event:
     je expose
 
     ; Unhandled event
-    mov rdi, dev_log.event_not_recognized
-    sub rsp, 8
-    call printf
-    add rsp, 8
 
     ret
 
     ; Key press
 key_press:
-    ; Logs TODO: remove in production code
-    mov rdi, dev_log.keypress
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     ; Get keysym
     mov rdi, [display]
     mov esi, [xevent + 84]
@@ -459,60 +517,32 @@ key_press:
     cmp eax, [XK_Esc]
     je exit_program
 
-    ; Unhandled key
-    mov rdi, dev_log.key_press_not_recognized
-    sub rsp, 8
-    call printf
-    add rsp, 8
+    ; Unhandled key press
 
     ret
 
-    ; Left
 left:
-    mov rdi, dev_log.left
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     ; Set snake direction to left
     mov al, [going_left]
     mov [snake_dir], al
 
     ret
 
-    ; Right
 right:
-    mov rdi, dev_log.right
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     ; Set snake direction to right
     mov al, [going_right]
     mov [snake_dir], al
 
     ret
 
-    ; Up
 up:
-    mov rdi, dev_log.up
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     ; Set snake direction to up
     mov al, [going_up]
     mov [snake_dir], al
 
     ret
 
-    ; Down
 down:
-    mov rdi, dev_log.down
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     ; Set snake direction to down
     mov al, [going_down]
     mov [snake_dir], al
@@ -520,12 +550,6 @@ down:
     ret
 
 expose: 
-    ; Logs TODO: remove in production code
-    mov rdi, dev_log.expose
-    sub rsp, 8
-    call printf
-    add rsp, 8
-
     ; Redraw window
     sub rsp, 8
     call draw
@@ -552,10 +576,45 @@ draw:
     call XFillRectangle
     pop r9
 
+    ; Calculate food coordinates
+    movzx rax, byte [tile_size]
+    mul byte [food_x]
+    mov rcx, rax
+    movzx rax, byte [tile_size]
+    mul byte [food_y]
+    mov r8, rax
+
+    ; Fill rectangle
+    mov rdi, [display]
+    mov rsi, [window]
+    mov rdx, [gc_white]
+    movzx r9, byte [tile_size]
+    push r9
+    call XFillRectangle
+    pop r9
+
+    ; Calculate end coordinates to be erased
+    movzx rax, byte [tile_size]
+    mul byte [snake_end_x]
+    mov rcx, rax
+    movzx rax, byte [tile_size]
+    mul byte [snake_end_y]
+    mov r8, rax
+
+    ; Fill rectangle
+    mov rdi, [display]
+    mov rsi, [window]
+    mov rdx, [gc_black]
+    movzx r9, byte [tile_size]
+    push r9
+    call XFillRectangle
+    pop r9
+
     ret
 
 exit_program:
     mov rdi, game_log.end
+    movzx rsi, word [snake_length]
     sub rsp, 8
     call printf
     add rsp, 8
@@ -573,7 +632,85 @@ exit_program:
     add rsp, 8
 
 
+; ----------- Utility functions -----------
 
+; Randomizes food position, returns void
+randomize_food_xy:
+	mov	rdi, food_x
+	mov rsi, 1
+	xor	rdx, rdx
+    sub rsp, 8
+	call getrandom
+	add rsp, 8
+
+    ; Zero two most significant bits
+    shl byte [food_x], 2
+    shr byte [food_x], 2
+
+	mov	rdi, food_y
+	mov rsi, 1
+	xor	rdx, rdx
+    sub rsp, 8
+	call getrandom
+	add rsp, 8
+
+    ; Zero two most significant bits
+    shl byte [food_y], 2
+    shr byte [food_y], 2
+
+    ; If food is on the snake head, randomize again
+    mov bl, [food_x]
+    mov cl, [food_y]
+    sub rsp, 8
+    call collides_with_snake_head
+    add rsp, 8
+    test al, al
+    jnz randomize_food_xy
+
+    ; If food is on the snake end, randomize again
+    sub rsp, 8
+    call collides_with_snake_tail
+    add rsp, 8
+    test al, al
+    jnz randomize_food_xy
+
+    ret
+
+; Check if coordinates in bl (x) and cl (y) are in snake head, return al = 1 if they are, 0 otherwise
+collides_with_snake_head:
+    cmp bl, [snake_head_x]
+    jne doesnt_collide
+    cmp cl, [snake_head_y]
+    jne doesnt_collide
+
+; Check if coordinates in bl (x) and cl (y) are in snake tail, return al = 1 if they are, 0 otherwise
+collides_with_snake_tail:
+    xor dl, dl
+    mov r14, [snake_tail_x]
+    mov r15, [snake_tail_y]
+
+    dec r14
+    dec r15
+    dec dl
+check_tail: 
+    inc r14
+    inc r15
+    inc dl
+    cmp dl, [snake_length]
+    jge doesnt_collide
+
+    cmp bl, [r14]
+    jne check_tail
+    cmp cl, [r15]
+    jne check_tail
+
+collides: 
+    mov al, 1
+    ret
+
+doesnt_collide: 
+    mov al, 0
+    ret
 
 
 
