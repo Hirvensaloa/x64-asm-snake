@@ -88,7 +88,7 @@ snake_dir resb 1
 snake_length resw 1
 food_x resb 1
 food_y resb 1
-advance_game resb 1
+advance_game_flag resb 1
 
 
 ; Pixel values
@@ -433,7 +433,7 @@ main_loop:
     ; Update last tick count
     mov [last_tick_count], rax
 
-    cmp [advance_game], 0
+    cmp byte [advance_game_flag], 0
     jne draw_new
 
     ; Update game state
@@ -442,7 +442,7 @@ main_loop:
     add rsp, 8
 
 draw_new:
-    mov [advance_game], 0
+    mov byte [advance_game_flag], 0
 
     ; draw new state
     sub rsp, 8
